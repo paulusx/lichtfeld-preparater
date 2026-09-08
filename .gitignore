@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# COLMAP artifacts, in case anyone reconstructs inside the repo
+*.db
+*.db-shm
+*.db-wal
+sparse/
+images/
+output/
