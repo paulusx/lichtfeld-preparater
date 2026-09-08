@@ -127,6 +127,15 @@ inputs.lichtfeld-preparater.url = "github:paulusx/lichtfeld-preparater";
 inputs.lichtfeld-preparater.packages.${pkgs.system}.default
 ```
 
+On a channel-based (non-flake) NixOS, `package.nix` is `callPackage`-shaped, so an
+overlay can import it and substitute its own COLMAP:
+
+```nix
+lichtfeld-preparater = prev.callPackage "${src}/package.nix" {
+  colmap = final.colmapWithCuda;
+};
+```
+
 `nix develop` gives a shell with Python, `typer`, `colmap` and `ffmpeg` for
 running `./lichtfeld_preparater.py` straight from the checkout.
 
