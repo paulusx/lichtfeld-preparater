@@ -105,6 +105,31 @@ Run `./lichtfeld_preparater.py --help` for the full list.
 pip install -r requirements.txt
 ```
 
+## Nix
+
+The flake installs the script as `lichtfeld-preparater`, with `colmap` and
+`ffmpeg` wired into its `PATH`:
+
+```bash
+nix run github:paulusx/lichtfeld-preparater -- ~/Videos/hall.mp4 ~/Datasets/hall-colmap
+nix profile install github:paulusx/lichtfeld-preparater
+```
+
+Both are appended to `PATH`, not prepended, so a CUDA `colmap` you already have
+still takes precedence — as do `--colmap` and `--ffmpeg`.
+
+In a system or Home Manager flake:
+
+```nix
+inputs.lichtfeld-preparater.url = "github:paulusx/lichtfeld-preparater";
+
+# then, in your package list:
+inputs.lichtfeld-preparater.packages.${pkgs.system}.default
+```
+
+`nix develop` gives a shell with Python, `typer`, `colmap` and `ffmpeg` for
+running `./lichtfeld_preparater.py` straight from the checkout.
+
 ## Notes
 
 - Option names differ between COLMAP releases (`SiftExtraction.*` in 3.x became
