@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Convert a flat image folder or a video file into a COLMAP dataset
-(images/ + database.db + sparse/).
+"""Convert a flat image folder, or one or more video files, into a COLMAP
+dataset (images/ + database.db + sparse/).
 
 Target layout, matching ~/Datasets/person-hall:
 
     <output>/
-      images/         copied (or linked) source images, or frames sampled from a video
+      images/         copied (or linked) source images, or frames sampled from the videos
       database.db     COLMAP feature/match database
       sparse/         reconstructed model in TXT format
         cameras.txt
@@ -15,6 +15,7 @@ Target layout, matching ~/Datasets/person-hall:
 Examples:
     ./lichtfeld_preparater.py ~/Datasets/belval/images_long1600 ~/Datasets/belval-colmap
     ./lichtfeld_preparater.py ~/Videos/hall.mp4 ~/Datasets/hall-colmap --fps 3
+    ./lichtfeld_preparater.py ~/Videos/hall-1.mp4 ~/Videos/hall-2.mp4 ~/Datasets/hall-colmap
 """
 
 from __future__ import annotations
@@ -200,30 +201,39 @@ def auto_fps(seconds: float, native: Optional[float]) -> float:
 def resolve_fps(
     fps: float,
     ffmpeg: str,
-    video: Path,
+    videos: list[Path],
     start: Optional[str],
     duration: Optional[str],
 ) -> float:
-    """Turn --fps auto into a concrete rate, reporting what was chosen and why."""
+    """Turn --fps auto into a concrete rate, reporting what was chosen and why.
+
+    Several videos share one rate, chosen from their combined length, so the
+    whole capture lands near TARGET_FRAMES rather than each clip.
+    """
     if fps != AUTO_FPS:
         return fps
 
-    total, native = probe_video(ffprobe_for(ffmpeg), video)
-    if total is None:
-        typer.secho(
-            f"    could not probe {video.name} duration — falling back to {FALLBACK_FPS} fps",
-            fg=typer.colors.YELLOW,
-        )
-        return FALLBACK_FPS
+    span = 0.0
+    natives: list[float] = []
+    for video in videos:
+        total, native = probe_video(ffprobe_for(ffmpeg), video)
+        if total is None:
+            typer.secho(
+                f"    could not probe {video.name} duration — falling back to {FALLBACK_FPS} fps",
+                fg=typer.colors.YELLOW,
+            )
+            return FALLBACK_FPS
+        # Sample against the span actually being extracted, not the whole file.
+        clip = total
+        if start is not None and (offset := parse_timestamp(start)) is not None:
+            clip -= offset
+        if duration is not None and (window := parse_timestamp(duration)) is not None:
+            clip = min(clip, window)
+        span += max(clip, 0.0)
+        if native:
+            natives.append(native)
 
-    # Sample against the span actually being extracted, not the whole file.
-    span = total
-    if start is not None and (offset := parse_timestamp(start)) is not None:
-        span -= offset
-    if duration is not None and (window := parse_timestamp(duration)) is not None:
-        span = min(span, window)
-
-    chosen = auto_fps(span, native)
+    chosen = auto_fps(span, min(natives) if natives else None)
     typer.secho(
         f"    {span:.1f}s of video → "
         + ("every frame" if chosen <= 0 else f"{chosen} fps")
@@ -241,8 +251,9 @@ def extract_frames(
     start: Optional[str],
     duration: Optional[str],
     quality: int,
+    prefix: str = "",
 ) -> list[Path]:
-    """Sample frames out of a video into dest/frame_%06d.jpg."""
+    """Sample frames out of a video into dest/<prefix>frame_%06d.jpg."""
     dest.mkdir(parents=True, exist_ok=True)
     argv = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
     if start is not None:  # before -i so ffmpeg seeks instead of decoding the head
@@ -252,13 +263,13 @@ def extract_frames(
     argv += ["-i", str(video)]
     if fps > 0:
         argv += ["-vf", f"fps={fps}"]
-    argv += ["-qscale:v", str(quality), "-vsync", "0", str(dest / "frame_%06d.jpg")]
+    argv += ["-qscale:v", str(quality), "-vsync", "0", str(dest / f"{prefix}frame_%06d.jpg")]
 
     typer.secho("    " + " ".join(argv), fg=typer.colors.BRIGHT_BLACK)
     result = subprocess.run(argv)
     if result.returncode != 0:
         raise typer.Exit(code=result.returncode)
-    return sorted(dest.glob("frame_*.jpg"))
+    return sorted(dest.glob(f"{prefix}frame_*.jpg"))
 
 
 def thin_frames(frames: list[Path], limit: int) -> list[Path]:
@@ -288,12 +299,14 @@ def pick_largest_model(sparse_root: Path) -> Path:
 
 @app.command()
 def main(
-    source: Path = typer.Argument(
+    sources: list[Path] = typer.Argument(
         ...,
         exists=True,
         readable=True,
-        help="Folder with the input images (e.g. .../images_long1600), or a video file "
-        "to sample frames from.",
+        show_default=False,
+        help="Folder with the input images (e.g. .../images_long1600), or one or more "
+        "video files to sample frames from. Frames from several videos go into one "
+        "dataset, reconstructed together.",
     ),
     output: Path = typer.Argument(
         ..., help="Destination dataset root to create (person-hall style)."
@@ -302,8 +315,9 @@ def main(
         None,
         "--matcher",
         "-m",
-        help="Matching strategy. Defaults to 'exhaustive' for image folders and "
-        "'sequential' for videos; 'vocab_tree' scales to thousands of unordered images.",
+        help="Matching strategy. Defaults to 'exhaustive' for image folders and several "
+        "videos, and 'sequential' for a single video; 'vocab_tree' scales to thousands "
+        "of unordered images.",
     ),
     camera_model: CameraModel = typer.Option(
         CameraModel.opencv, "--camera-model", "-c", help="COLMAP camera model."
@@ -330,13 +344,18 @@ def main(
     max_frames: int = typer.Option(
         0,
         "--max-frames",
-        help="Video only: cap the number of frames, dropping evenly spaced extras. 0 = no cap.",
+        help="Video only: cap the number of frames, dropping evenly spaced extras. With "
+        "several videos the cap is for all of them, shared in proportion. 0 = no cap.",
     ),
     start: Optional[str] = typer.Option(
-        None, "--start", help="Video only: skip to this timestamp (ffmpeg -ss, e.g. 00:00:10)."
+        None,
+        "--start",
+        help="Video only: skip to this timestamp (ffmpeg -ss, e.g. 00:00:10), in every video.",
     ),
     duration: Optional[str] = typer.Option(
-        None, "--duration", help="Video only: how much to read from --start (ffmpeg -t)."
+        None,
+        "--duration",
+        help="Video only: how much to read from --start (ffmpeg -t), in every video.",
     ),
     frame_quality: int = typer.Option(
         2,
@@ -374,21 +393,36 @@ def main(
     ),
 ) -> None:
     """Run the full COLMAP pipeline and lay the result out as a person-hall style dataset."""
-    is_video = source.is_file()
-    if is_video and source.suffix.lower() not in VIDEO_SUFFIXES:
+    videos = [s for s in sources if s.is_file()]
+    folders = [s for s in sources if not s.is_file()]
+    for video in videos:
+        if video.suffix.lower() not in VIDEO_SUFFIXES:
+            typer.secho(
+                f"{video} is a file but not a recognised video "
+                f"({', '.join(sorted(VIDEO_SUFFIXES))}). Pass a folder of images instead.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=2)
+    if folders and (videos or len(folders) > 1):
         typer.secho(
-            f"{source} is a file but not a recognised video "
-            f"({', '.join(sorted(VIDEO_SUFFIXES))}). Pass a folder of images instead.",
+            "Pass either one folder of images, or one or more videos — not a mix.",
             fg=typer.colors.RED,
             err=True,
         )
         raise typer.Exit(code=2)
+    is_video = bool(videos)
+    source = folders[0] if folders else videos[0]
 
     if matcher is None:
-        matcher = Matcher.sequential if is_video else Matcher.exhaustive
+        # One clip's frames are in order; several clips have to be matched
+        # against each other too, which only exhaustive matching does.
+        matcher = Matcher.sequential if len(videos) == 1 else Matcher.exhaustive
         if is_video:
             typer.secho(
-                "Video source — using --matcher sequential (frames are ordered).",
+                "Video source — using --matcher sequential (frames are ordered)."
+                if len(videos) == 1
+                else f"{len(videos)} videos — using --matcher exhaustive (clips must match each other).",
                 fg=typer.colors.YELLOW,
             )
 
@@ -432,18 +466,27 @@ def main(
     sparse_dir.mkdir(parents=True, exist_ok=True)
 
     if is_video:
-        echo_step(f"Extracting frames from {source.name} into {images_dir}")
-        fps = resolve_fps(fps, ffmpeg_bin, source, start, duration)
-        frames = extract_frames(
-            ffmpeg_bin, source, images_dir, fps, start, duration, frame_quality
-        )
-        if not frames:
-            typer.secho(f"ffmpeg produced no frames from {source}", fg=typer.colors.RED, err=True)
-            raise typer.Exit(code=1)
+        fps = resolve_fps(fps, ffmpeg_bin, videos, start, duration)
+        frames: list[Path] = []
+        for n, video in enumerate(videos, 1):
+            echo_step(f"Extracting frames from {video.name} into {images_dir}")
+            # A single video keeps plain frame_NNNNNN names; several get a
+            # per-clip prefix so their frames neither collide nor interleave.
+            prefix = "" if len(videos) == 1 else f"v{n:02d}_"
+            got = extract_frames(
+                ffmpeg_bin, video, images_dir, fps, start, duration, frame_quality, prefix
+            )
+            if not got:
+                typer.secho(f"ffmpeg produced no frames from {video}", fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1)
+            frames += got
+        # Sorted by name the clips follow one another, so evenly spaced
+        # thinning takes from each in proportion to its length.
         images_in = thin_frames(frames, max_frames)
         typer.secho(
             f"    {len(images_in)} frames"
-            + (f" (thinned from {len(frames)})" if len(images_in) < len(frames) else ""),
+            + (f" (thinned from {len(frames)})" if len(images_in) < len(frames) else "")
+            + (f" from {len(videos)} videos" if len(videos) > 1 else ""),
             fg=typer.colors.BRIGHT_BLACK,
         )
     else:

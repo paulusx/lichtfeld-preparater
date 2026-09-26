@@ -1,6 +1,6 @@
 # lichtfeld-preparater
 
-Converts a flat folder of images — or a video file — into a COLMAP dataset laid out
+Converts a flat folder of images — or one or more video files — into a COLMAP dataset laid out
 the way downstream training tools expect (the `person-hall` layout).
 
 ## Input
@@ -41,6 +41,19 @@ From a video — frames are sampled into `images/` as `frame_000001.jpg`, …:
 ./lichtfeld_preparater.py ~/Videos/hall.mp4 ~/Datasets/hall-colmap
 ```
 
+Several videos of the same scene — walked in separate takes, say — go into one
+dataset and are reconstructed together. Their frames are named after the clip
+(`v01_frame_000001.jpg`, `v02_frame_000001.jpg`, …), and matching defaults to
+`exhaustive`, since frames of one clip must be matched against the others:
+
+```bash
+./lichtfeld_preparater.py hall-take1.mp4 hall-take2.mp4 ~/Datasets/hall-colmap --fps -1 --max-frames 300
+```
+
+`--fps -1` then picks one rate from the clips' combined length, `--max-frames`
+caps all of them together (each keeps its share, by length), and `--start` /
+`--duration` apply to every clip.
+
 Every frame of the clip is kept by default. Long captures can therefore produce a
 lot of images — cap them with `--max-frames`, or thin the sampling with `--fps`.
 Passing `--fps -1` restores the adaptive rate, which targets ~200 frames from the
@@ -76,7 +89,7 @@ Large unordered collections need a vocabulary tree
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--matcher` / `-m` | `exhaustive` (images), `sequential` (video) | `exhaustive`, `sequential`, `vocab_tree`, `spatial` |
+| `--matcher` / `-m` | `exhaustive` (images, several videos), `sequential` (one video) | `exhaustive`, `sequential`, `vocab_tree`, `spatial` |
 | `--camera-model` / `-c` | `OPENCV` | COLMAP camera model |
 | `--single-camera` / `--per-image-camera` | single | Share one intrinsics block across all images |
 | `--link-mode` / `-l` | `copy` | `copy`, `symlink`, `hardlink` (image folders only) |
