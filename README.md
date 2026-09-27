@@ -93,6 +93,14 @@ lot of images — cap them with `--max-frames`, or thin the sampling with `--fps
 Passing `--fps -1` restores the adaptive rate, which targets ~200 frames from the
 clip's duration and never drops below 1 fps.
 
+`--every N` keeps one frame in every N instead, counted in the video's own
+frames (from `--start`), which suits clips whose frame rate you know. It
+replaces `--fps`; the two cannot be combined. Every third frame, uncapped:
+
+```bash
+./lichtfeld_preparater.py hall.mp4 OUT --every 3 --max-frames 0
+```
+
 Sample a slice of a long clip and cap the frame count:
 
 ```bash
@@ -128,6 +136,7 @@ Large unordered collections need a vocabulary tree
 | `--single-camera` / `--per-image-camera` | single | Share one intrinsics block across all images |
 | `--link-mode` / `-l` | `copy` | `copy`, `symlink`, `hardlink` (image folders only) |
 | `--fps` | `0` (every frame) | Video: frames sampled per second; `-1` adapts the rate to the clip's duration, targeting ~200 frames |
+| `--every` | `1` | Video: keep one frame in every N, instead of `--fps` |
 | `--max-frames` | `0` | Video: cap frame count, dropping evenly spaced extras |
 | `--start` | — | Video: seek to this timestamp before sampling (`ffmpeg -ss`) |
 | `--duration` | — | Video: how much to read from `--start` (`ffmpeg -t`) |

@@ -15,6 +15,7 @@ Target layout, matching ~/Datasets/person-hall:
 Examples:
     ./lichtfeld_preparater.py ~/Datasets/belval/images_long1600 ~/Datasets/belval-colmap
     ./lichtfeld_preparater.py ~/Videos/hall.mp4 ~/Datasets/hall-colmap --fps 3
+    ./lichtfeld_preparater.py ~/Videos/hall.mp4 ~/Datasets/hall-colmap --every 5
     ./lichtfeld_preparater.py ~/Videos/hall-1.mp4 ~/Videos/hall-2.mp4 ~/Datasets/hall-colmap
     ./lichtfeld_preparater.py ~/Videos/VID_..._00_005.insv ~/Datasets/park-colmap --fps -1
 
@@ -268,11 +269,21 @@ def resolve_fps(
     return chosen
 
 
+def sampling_filter(fps: float, every: int) -> Optional[str]:
+    """The ffmpeg filter that picks which frames to keep, or None for all of them."""
+    if every > 1:
+        # Counted from the first decoded frame, i.e. from --start.
+        return f"select=not(mod(n\\,{every}))"
+    if fps > 0:
+        return f"fps={fps}"
+    return None
+
+
 def extract_frames(
     ffmpeg: str,
     video: Path,
     dest: Path,
-    fps: float,
+    sample: Optional[str],
     start: Optional[str],
     duration: Optional[str],
     quality: int,
@@ -286,8 +297,8 @@ def extract_frames(
     if duration is not None:
         argv += ["-t", duration]
     argv += ["-i", str(video)]
-    if fps > 0:
-        argv += ["-vf", f"fps={fps}"]
+    if sample is not None:
+        argv += ["-vf", sample]
     argv += ["-qscale:v", str(quality), "-vsync", "0", str(dest / f"{prefix}frame_%06d.jpg")]
 
     typer.secho("    " + " ".join(argv), fg=typer.colors.BRIGHT_BLACK)
@@ -409,7 +420,7 @@ def extract_views(
     views: list[View],
     lens_fov: float,
     dest: Path,
-    fps: float,
+    sample: Optional[str],
     start: Optional[str],
     duration: Optional[str],
     quality: int,
@@ -432,7 +443,7 @@ def extract_views(
     sources = list(dict.fromkeys(view.source for view in views))
     for s, source in enumerate(sources):
         mine = [n for n, view in enumerate(views) if view.source == source]
-        chain = source + (f"fps={fps}," if fps > 0 else "")
+        chain = source + (f"{sample}," if sample is not None else "")
         graph.append(f"{chain}split={len(mine)}" + "".join(f"[s{s}_{n}]" for n in mine))
         for n in mine:
             graph.append(f"[s{s}_{n}]{view_filter(views[n], lens_fov)}[o{n}]")
@@ -558,6 +569,13 @@ def main(
         f"the count with --max-frames. Pass {AUTO_FPS:g} to adapt the rate to the clip's "
         f"length instead, aiming for ~{TARGET_FRAMES} frames (never below {MIN_AUTO_FPS} fps).",
     ),
+    every: int = typer.Option(
+        1,
+        "--every",
+        min=1,
+        help="Video only: keep one frame in every N, counted in the video's own frames. "
+        "Instead of --fps; 1 = every frame. Combine with --max-frames 0 to keep them all.",
+    ),
     max_frames: int = typer.Option(
         0,
         "--max-frames",
@@ -647,6 +665,9 @@ def main(
         )
         raise typer.Exit(code=2)
     is_video = bool(videos)
+    if every > 1 and fps != 0:
+        typer.secho("Pass either --fps or --every, not both.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
     source = folders[0] if folders else videos[0]
 
     if matcher is None:
@@ -719,6 +740,7 @@ def main(
     rigs: list[dict] = []
     if is_video:
         fps = resolve_fps(fps, ffmpeg_bin, videos, start, duration)
+        sample = sampling_filter(fps, every)
         frames: list[list[Path]] = []
         clips: list[tuple[Path, str, list[list[Path]]]] = []
         for n, video in enumerate(videos, 1):
@@ -729,13 +751,13 @@ def main(
             if views := layouts[video]:
                 got = extract_views(
                     ffmpeg_bin, video, views, lens_fov, images_dir,
-                    fps, start, duration, frame_quality, prefix,
+                    sample, start, duration, frame_quality, prefix,
                 )
             else:
                 got = [
                     [frame]
                     for frame in extract_frames(
-                        ffmpeg_bin, video, images_dir, fps, start, duration, frame_quality, prefix
+                        ffmpeg_bin, video, images_dir, sample, start, duration, frame_quality, prefix
                     )
                 ]
             if not got:
