@@ -14,8 +14,9 @@ Any directory of images:
   ...
 ```
 
-…or a single video file (`.mp4`, `.mov`, `.mkv`, `.avi`, `.m4v`, `.webm`, `.mpg`,
+…or one or more video files (`.mp4`, `.mov`, `.mkv`, `.avi`, `.m4v`, `.webm`, `.mpg`,
 `.mpeg`, `.mts`, `.insv`), from which `ffmpeg` samples frames into `images/`.
+360° video is supported; see below.
 
 ## Output
 
@@ -53,6 +54,39 @@ dataset and are reconstructed together. Their frames are named after the clip
 `--fps -1` then picks one rate from the clips' combined length, `--max-frames`
 caps all of them together (each keeps its share, by length), and `--start` /
 `--duration` apply to every clip.
+
+### 360° video
+
+360° clips are cut into flat views before reconstruction, since COLMAP and the
+trainers downstream want pinhole cameras:
+
+- An Insta360 `.insv` in 360 mode holds one circular fisheye per lens. Each lens
+  gives three 90° views, straight ahead and 45° to either side, so no view
+  crosses the seam between the lenses.
+- An equirectangular video (a 2:1 export from Insta360 Studio, say) gives six
+  90° views, 60° apart around the horizon.
+
+`--panorama auto` (the default) recognises both per clip, so 360° and ordinary
+clips of the same scene can be mixed:
+
+```bash
+./lichtfeld_preparater.py VID_..._00_005.insv VID_..._00_006.mp4 ~/Datasets/park-colmap --fps -1
+```
+
+The views of one moment are tied together as a COLMAP 4 camera rig: they are
+posed as one, with their relative directions known up front and only refined.
+Frames are named `c<N>_frame_000001.jpg` (with the clip prefix, when there are
+several), each view is a `PINHOLE` camera of its own, and `--max-frames` counts
+moments, so a 360° clip contributes six images for every frame it keeps.
+
+The raw `.insv` path assumes equidistant lenses of `--lens-fov` (200°) and
+leaves the rest to COLMAP's refinement. An equirectangular export from
+Insta360 Studio uses the camera's factory calibration and is the more accurate
+source. The person holding the camera appears in some views and moves with
+it; COLMAP mostly rejects those matches as outliers, but a selfie stick held
+overhead keeps them smaller.
+
+### Frame count
 
 Every frame of the clip is kept by default. Long captures can therefore produce a
 lot of images — cap them with `--max-frames`, or thin the sampling with `--fps`.
@@ -98,6 +132,9 @@ Large unordered collections need a vocabulary tree
 | `--start` | — | Video: seek to this timestamp before sampling (`ffmpeg -ss`) |
 | `--duration` | — | Video: how much to read from `--start` (`ffmpeg -t`) |
 | `--frame-quality` | `2` | Video: JPEG quality of extracted frames (1 = best) |
+| `--panorama` | `auto` | Video: `auto`, `off`, `equirect`, `dual-fisheye` — how to treat 360° clips |
+| `--lens-fov` | `200` | Dual fisheye: field of view of each lens, in degrees |
+| `--rig` / `--no-rig` | rig | Pose the views of each 360° frame together as a COLMAP rig |
 | `--ffmpeg` | `ffmpeg` | Path to the ffmpeg executable |
 | `--gpu` / `--no-gpu` | GPU | CUDA for SIFT extraction and matching |
 | `--max-image-size` | `3200` | Downscale limit during feature extraction |
@@ -157,6 +194,7 @@ running `./lichtfeld_preparater.py` straight from the checkout.
 - Option names differ between COLMAP releases (`SiftExtraction.*` in 3.x became
   `FeatureExtraction.*` in 4.x). The script reads each subcommand's `--help` and
   picks whichever your build accepts, so it works on both.
+- 360° rigs need COLMAP 4.x (`rig_configurator`); with 3.x pass `--no-rig`.
 - COLMAP 4.x also writes `frames.txt` and `rigs.txt`. These are removed by default
   so `sparse/` matches the `person-hall` layout; keep them with `--keep-rig-files`.
 - Video frames are written straight into `images/`, so `--link-mode` does not apply.

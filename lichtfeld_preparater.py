@@ -16,13 +16,21 @@ Examples:
     ./lichtfeld_preparater.py ~/Datasets/belval/images_long1600 ~/Datasets/belval-colmap
     ./lichtfeld_preparater.py ~/Videos/hall.mp4 ~/Datasets/hall-colmap --fps 3
     ./lichtfeld_preparater.py ~/Videos/hall-1.mp4 ~/Videos/hall-2.mp4 ~/Datasets/hall-colmap
+    ./lichtfeld_preparater.py ~/Videos/VID_..._00_005.insv ~/Datasets/park-colmap --fps -1
+
+360° videos (Insta360 .insv dual fisheye, or an equirectangular export) are cut
+into several flat views per frame, tied together as a COLMAP camera rig.
 """
 
 from __future__ import annotations
 
+import json
+import math
 import shutil
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -55,6 +63,23 @@ class CameraModel(str, Enum):
     opencv = "OPENCV"
     opencv_fisheye = "OPENCV_FISHEYE"
     full_opencv = "FULL_OPENCV"
+
+
+class Panorama(str, Enum):
+    auto = "auto"
+    off = "off"
+    equirect = "equirect"
+    dual_fisheye = "dual-fisheye"
+
+
+# How a 360° frame is cut into flat views. Each view is a square pinhole camera
+# of VIEW_FOV degrees; neighbours overlap so features carry across them.
+VIEW_FOV = 90.0
+EQUIRECT_YAWS = (0.0, 60.0, 120.0, 180.0, 240.0, 300.0)
+# Dual fisheye: views stay within one lens each, so none straddles the stitch
+# seam. Yaws are relative to that lens's axis; the back lens faces yaw 180.
+LENS_YAWS = (-45.0, 0.0, 45.0)
+DEFAULT_LENS_FOV = 200.0  # Insta360 X-series lenses see a bit over a hemisphere
 
 
 class LinkMode(str, Enum):
@@ -272,16 +297,208 @@ def extract_frames(
     return sorted(dest.glob(f"{prefix}frame_*.jpg"))
 
 
-def thin_frames(frames: list[Path], limit: int) -> list[Path]:
-    """Keep at most `limit` evenly spaced frames, deleting the rest."""
+@dataclass(frozen=True)
+class View:
+    """One flat view cut out of a 360° video."""
+
+    source: str  # ffmpeg filter input: a stream label, then a crop for side-by-side lenses
+    yaw: float  # in the source: equirect yaw, or offset from the lens axis
+    rig_yaw: float  # direction of the view within the rig, which faces yaw 0
+    fisheye: bool
+    size: int  # square output, in pixels
+
+
+def video_streams(ffprobe: str, video: Path) -> list[tuple[str, int, int]]:
+    """(ffmpeg label, width, height) of each real video stream — cover art is skipped."""
+    argv = [
+        ffprobe, "-v", "error",
+        "-select_streams", "v",
+        "-show_entries", "stream=width,height:stream_disposition=attached_pic",
+        "-of", "csv=p=0",
+        str(video),
+    ]
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    except OSError:
+        return []
+    streams = []
+    for n, line in enumerate(result.stdout.splitlines()):
+        fields = line.strip().split(",")
+        if len(fields) < 3 or fields[2] == "1":
+            continue
+        try:
+            streams.append((f"[0:v:{n}]", int(fields[0]), int(fields[1])))
+        except ValueError:
+            pass
+    return streams
+
+
+def even(value: float) -> int:
+    return max(2, int(round(value / 2)) * 2)
+
+
+def panorama_views(
+    ffprobe: str, video: Path, mode: Panorama, lens_fov: float
+) -> list[View]:
+    """The flat views to cut out of this video, or [] if it is an ordinary one.
+
+    auto recognises an .insv with one stream per lens (Insta360 X-series), an
+    .insv with both lenses side by side in one stream (older models), and any
+    other 2:1 video as equirectangular.
+    """
+    if mode is Panorama.off:
+        return []
+    streams = video_streams(ffprobe, video)
+    if not streams:
+        return []
+    first, width, height = streams[0]
+    two_lenses = len(streams) >= 2 and streams[1][1:] == (width, height) and width == height
+    side_by_side = len(streams) == 1 and width == 2 * height
+
+    if mode is Panorama.auto:
+        if two_lenses or (side_by_side and video.suffix.lower() == ".insv"):
+            mode = Panorama.dual_fisheye
+        elif side_by_side:
+            mode = Panorama.equirect
+        else:
+            return []
+
+    if mode is Panorama.equirect:
+        size = even(width * VIEW_FOV / 360)
+        return [View(first, yaw, yaw, False, size) for yaw in EQUIRECT_YAWS]
+
+    if two_lenses:
+        lenses = [first, streams[1][0]]
+    elif side_by_side:
+        lenses = [f"{first}crop=iw/2:ih:0:0,", f"{first}crop=iw/2:ih:iw/2:0,"]
+    else:
+        typer.secho(
+            f"{video.name}: expected two square lens streams, or both lenses side by "
+            f"side in one 2:1 stream, got {[s[1:] for s in streams]}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    size = even(height * VIEW_FOV / lens_fov)
+    return [
+        View(source, yaw, (axis + yaw) % 360, True, size)
+        for source, axis in zip(lenses, (0.0, 180.0))
+        for yaw in LENS_YAWS
+    ]
+
+
+def view_filter(view: View, lens_fov: float) -> str:
+    projection = (
+        f"input=fisheye:ih_fov={lens_fov:g}:iv_fov={lens_fov:g}"
+        if view.fisheye
+        else "input=e"
+    )
+    return (
+        f"v360={projection}:output=flat:h_fov={VIEW_FOV:g}:v_fov={VIEW_FOV:g}"
+        f":yaw={view.yaw:g}:w={view.size}:h={view.size}"
+    )
+
+
+def view_prefix(prefix: str, n: int) -> str:
+    return f"{prefix}c{n}_"
+
+
+def extract_views(
+    ffmpeg: str,
+    video: Path,
+    views: list[View],
+    lens_fov: float,
+    dest: Path,
+    fps: float,
+    start: Optional[str],
+    duration: Optional[str],
+    quality: int,
+    prefix: str = "",
+) -> list[list[Path]]:
+    """Sample a 360° video into dest/<prefix>c<N>_frame_%06d.jpg, one file per view.
+
+    Returns the frames as groups: every view of one moment. The video is decoded
+    once; each lens is resampled first, so all views share the same timestamps.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    argv = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
+    if start is not None:
+        argv += ["-ss", start]
+    if duration is not None:
+        argv += ["-t", duration]
+    argv += ["-i", str(video)]
+
+    graph = []
+    sources = list(dict.fromkeys(view.source for view in views))
+    for s, source in enumerate(sources):
+        mine = [n for n, view in enumerate(views) if view.source == source]
+        chain = source + (f"fps={fps}," if fps > 0 else "")
+        graph.append(f"{chain}split={len(mine)}" + "".join(f"[s{s}_{n}]" for n in mine))
+        for n in mine:
+            graph.append(f"[s{s}_{n}]{view_filter(views[n], lens_fov)}[o{n}]")
+    argv += ["-filter_complex", ";".join(graph)]
+    for n in range(len(views)):
+        argv += [
+            "-map", f"[o{n}]",
+            "-qscale:v", str(quality),
+            "-fps_mode", "passthrough",
+            str(dest / f"{view_prefix(prefix, n)}frame_%06d.jpg"),
+        ]
+
+    typer.secho("    " + " ".join(argv), fg=typer.colors.BRIGHT_BLACK)
+    result = subprocess.run(argv)
+    if result.returncode != 0:
+        raise typer.Exit(code=result.returncode)
+
+    # A moment only counts if every view of it came out; drop stragglers.
+    per_view = [
+        {f.name[len(view_prefix(prefix, n)):]: f for f in dest.glob(f"{view_prefix(prefix, n)}frame_*.jpg")}
+        for n in range(len(views))
+    ]
+    common = set(per_view[0]).intersection(*per_view[1:])
+    for files in per_view:
+        for name, path in files.items():
+            if name not in common:
+                path.unlink()
+    return [[files[name] for files in per_view] for name in sorted(common)]
+
+
+def thin_frames(frames: list[list[Path]], limit: int) -> list[list[Path]]:
+    """Keep at most `limit` evenly spaced moments (all views of each), deleting the rest."""
     if limit <= 0 or len(frames) <= limit:
         return frames
     step = len(frames) / limit
-    keep = {frames[int(i * step)] for i in range(limit)}
-    for frame in frames:
-        if frame not in keep:
-            frame.unlink()
-    return sorted(keep)
+    keep = {int(i * step) for i in range(limit)}
+    for n, group in enumerate(frames):
+        if n not in keep:
+            for frame in group:
+                frame.unlink()
+    return [frames[n] for n in sorted(keep)]
+
+
+def cam_from_rig(yaw: float) -> list[float]:
+    """COLMAP quaternion (w, x, y, z) of a camera turned `yaw` degrees to the right.
+
+    COLMAP cameras look down +z with y pointing down, so a yaw is a rotation
+    about y; cam_from_rig is its inverse.
+    """
+    half = math.radians(-yaw) / 2
+    return [math.cos(half), 0.0, math.sin(half), 0.0]
+
+
+def pinhole_params(size: int) -> str:
+    focal = size / 2 / math.tan(math.radians(VIEW_FOV) / 2)
+    return f"{focal:.4f},{focal:.4f},{size / 2:g},{size / 2:g}"
+
+
+@dataclass
+class ImageGroup:
+    """Images that go through feature extraction with the same camera settings."""
+
+    names: list[str]
+    camera_model: str
+    single_camera: bool
+    camera_params: Optional[str] = None
 
 
 def pick_largest_model(sparse_root: Path) -> Path:
@@ -363,6 +580,24 @@ def main(
         min=1,
         max=31,
         help="Video only: JPEG quality of extracted frames (ffmpeg -qscale:v, 1 = best).",
+    ),
+    panorama: Panorama = typer.Option(
+        Panorama.auto,
+        "--panorama",
+        help="Video only: how to treat 360° video. auto detects an Insta360 .insv (dual "
+        "fisheye) or a 2:1 equirectangular video per clip; the others force one kind on "
+        f"every clip. Each 360° frame becomes {len(EQUIRECT_YAWS)} flat {VIEW_FOV:g}° views.",
+    ),
+    lens_fov: float = typer.Option(
+        DEFAULT_LENS_FOV,
+        "--lens-fov",
+        help="Dual fisheye only: field of view of each lens, in degrees.",
+    ),
+    rig: bool = typer.Option(
+        True,
+        "--rig/--no-rig",
+        help="Tie the views of each 360° frame together as a COLMAP rig, so they are "
+        "posed as one. --no-rig reconstructs them as independent images.",
     ),
     ffmpeg_bin: str = typer.Option("ffmpeg", "--ffmpeg", help="Path to the ffmpeg executable."),
     vocab_tree_path: Optional[Path] = typer.Option(
@@ -449,6 +684,18 @@ def main(
             typer.secho(f"No images found in {source}", fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1)
 
+    layouts = {
+        video: panorama_views(ffprobe_for(ffmpeg_bin), video, panorama, lens_fov)
+        for video in videos
+    }
+    for video, views in layouts.items():
+        if views:
+            kind = "dual fisheye" if views[0].fisheye else "equirectangular"
+            typer.secho(
+                f"{video.name}: 360° {kind} — {len(views)} views of {views[0].size}px per frame",
+                fg=typer.colors.YELLOW,
+            )
+
     if output.exists() and any(output.iterdir()):
         if not force:
             typer.secho(
@@ -465,48 +712,112 @@ def main(
     sparse_dir = output / "sparse"
     sparse_dir.mkdir(parents=True, exist_ok=True)
 
+    # Flat images share the user's camera settings; each view of a 360° video
+    # is a camera of its own, with intrinsics known from the projection.
+    flat = ImageGroup([], camera_model.value, single_camera)
+    groups = [flat]
+    rigs: list[dict] = []
     if is_video:
         fps = resolve_fps(fps, ffmpeg_bin, videos, start, duration)
-        frames: list[Path] = []
+        frames: list[list[Path]] = []
+        clips: list[tuple[Path, str, list[list[Path]]]] = []
         for n, video in enumerate(videos, 1):
             echo_step(f"Extracting frames from {video.name} into {images_dir}")
             # A single video keeps plain frame_NNNNNN names; several get a
             # per-clip prefix so their frames neither collide nor interleave.
             prefix = "" if len(videos) == 1 else f"v{n:02d}_"
-            got = extract_frames(
-                ffmpeg_bin, video, images_dir, fps, start, duration, frame_quality, prefix
-            )
+            if views := layouts[video]:
+                got = extract_views(
+                    ffmpeg_bin, video, views, lens_fov, images_dir,
+                    fps, start, duration, frame_quality, prefix,
+                )
+            else:
+                got = [
+                    [frame]
+                    for frame in extract_frames(
+                        ffmpeg_bin, video, images_dir, fps, start, duration, frame_quality, prefix
+                    )
+                ]
             if not got:
                 typer.secho(f"ffmpeg produced no frames from {video}", fg=typer.colors.RED, err=True)
                 raise typer.Exit(code=1)
+            clips.append((video, prefix, got))
             frames += got
         # Sorted by name the clips follow one another, so evenly spaced
         # thinning takes from each in proportion to its length.
-        images_in = thin_frames(frames, max_frames)
+        kept = thin_frames(frames, max_frames)
+        images_in = [image for group in kept for image in group]
         typer.secho(
-            f"    {len(images_in)} frames"
-            + (f" (thinned from {len(frames)})" if len(images_in) < len(frames) else "")
-            + (f" from {len(videos)} videos" if len(videos) > 1 else ""),
+            f"    {len(kept)} frames"
+            + (f" (thinned from {len(frames)})" if len(kept) < len(frames) else "")
+            + (f" from {len(videos)} videos" if len(videos) > 1 else "")
+            + (f", {len(images_in)} images" if len(images_in) > len(kept) else ""),
             fg=typer.colors.BRIGHT_BLACK,
         )
+
+        present = {image.name for image in images_in}
+        for video, prefix, got in clips:
+            views = layouts[video]
+            if not views:
+                flat.names += [g[0].name for g in got if g[0].name in present]
+                continue
+            cameras = []
+            for n, view in enumerate(views):
+                groups.append(
+                    ImageGroup(
+                        [g[n].name for g in got if g[n].name in present],
+                        "PINHOLE",
+                        True,
+                        pinhole_params(view.size),
+                    )
+                )
+                camera: dict = {"image_prefix": view_prefix(prefix, n)}
+                if view.rig_yaw == 0:
+                    camera["ref_sensor"] = True
+                else:
+                    camera["cam_from_rig_rotation"] = cam_from_rig(view.rig_yaw)
+                    camera["cam_from_rig_translation"] = [0.0, 0.0, 0.0]
+                cameras.append(camera)
+            # COLMAP adds sensors in order and wants the reference one first.
+            cameras.sort(key=lambda camera: not camera.get("ref_sensor", False))
+            rigs.append({"cameras": cameras})
     else:
         echo_step(f"Staging {len(images_in)} images into {images_dir} ({link_mode.value})")
         place_images(images_in, images_dir, link_mode)
+        flat.names = [image.name for image in images_in]
 
     echo_step("Extracting SIFT features")
     extract_opts = supported_options(colmap_bin, "feature_extractor")
-    extract_args: dict[str, ArgValue] = {
-        "database_path": database,
-        "image_path": images_dir,
-        "ImageReader.camera_model": camera_model.value,
-        "ImageReader.single_camera": int(single_camera),
-    }
-    groups = ["FeatureExtraction", "SiftExtraction"]
-    if name := prefixed(extract_opts, groups, "use_gpu"):
-        extract_args[name] = int(gpu)
-    if name := prefixed(extract_opts, groups, "max_image_size"):
-        extract_args[name] = max_image_size
-    run(colmap_bin, "feature_extractor", extract_args)
+    feature_args: dict[str, ArgValue] = {}
+    option_groups = ["FeatureExtraction", "SiftExtraction"]
+    if name := prefixed(extract_opts, option_groups, "use_gpu"):
+        feature_args[name] = int(gpu)
+    if name := prefixed(extract_opts, option_groups, "max_image_size"):
+        feature_args[name] = max_image_size
+    with tempfile.TemporaryDirectory() as scratch:
+        for n, group in enumerate(g for g in groups if g.names):
+            image_list = Path(scratch) / f"images_{n}.txt"
+            image_list.write_text("".join(f"{name}\n" for name in group.names))
+            extract_args: dict[str, ArgValue] = {
+                "database_path": database,
+                "image_path": images_dir,
+                "image_list_path": image_list,
+                "ImageReader.camera_model": group.camera_model,
+                "ImageReader.single_camera": int(group.single_camera),
+            }
+            if group.camera_params is not None:
+                extract_args["ImageReader.camera_params"] = group.camera_params
+            run(colmap_bin, "feature_extractor", extract_args | feature_args)
+
+        if rigs and rig:
+            echo_step(f"Configuring {len(rigs)} camera rig(s) for the 360° views")
+            rig_config = Path(scratch) / "rigs.json"
+            rig_config.write_text(json.dumps(rigs, indent=2))
+            run(
+                colmap_bin,
+                "rig_configurator",
+                {"database_path": database, "rig_config_path": rig_config},
+            )
 
     echo_step(f"Matching features ({matcher.value})")
     match_command = f"{matcher.value}_matcher"
