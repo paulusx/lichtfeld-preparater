@@ -141,6 +141,7 @@ Large unordered collections need a vocabulary tree
 | `--start` | — | Video: seek to this timestamp before sampling (`ffmpeg -ss`) |
 | `--duration` | — | Video: how much to read from `--start` (`ffmpeg -t`) |
 | `--frame-quality` | `2` | Video: JPEG quality of extracted frames (1 = best) |
+| `--frame-format` | `jpg` | Video: `jpg` or `png` (lossless, several times larger) |
 | `--panorama` | `auto` | Video: `auto`, `off`, `equirect`, `dual-fisheye` — how to treat 360° clips |
 | `--lens-fov` | `200` | Dual fisheye: field of view of each lens, in degrees |
 | `--rig` / `--no-rig` | rig | Pose the views of each 360° frame together as a COLMAP rig |

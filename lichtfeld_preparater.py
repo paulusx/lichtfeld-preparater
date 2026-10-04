@@ -73,6 +73,16 @@ class Panorama(str, Enum):
     dual_fisheye = "dual-fisheye"
 
 
+class FrameFormat(str, Enum):
+    jpg = "jpg"
+    png = "png"
+
+
+def encode_args(fmt: FrameFormat, quality: int) -> list[str]:
+    """ffmpeg output options for one extracted frame; PNG is lossless, so no quality."""
+    return ["-qscale:v", str(quality)] if fmt is FrameFormat.jpg else []
+
+
 # How a 360° frame is cut into flat views. Each view is a square pinhole camera
 # of VIEW_FOV degrees; neighbours overlap so features carry across them.
 VIEW_FOV = 90.0
@@ -287,9 +297,10 @@ def extract_frames(
     start: Optional[str],
     duration: Optional[str],
     quality: int,
+    fmt: FrameFormat,
     prefix: str = "",
 ) -> list[Path]:
-    """Sample frames out of a video into dest/<prefix>frame_%06d.jpg."""
+    """Sample frames out of a video into dest/<prefix>frame_%06d.<fmt>."""
     dest.mkdir(parents=True, exist_ok=True)
     argv = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
     if start is not None:  # before -i so ffmpeg seeks instead of decoding the head
@@ -299,13 +310,13 @@ def extract_frames(
     argv += ["-i", str(video)]
     if sample is not None:
         argv += ["-vf", sample]
-    argv += ["-qscale:v", str(quality), "-vsync", "0", str(dest / f"{prefix}frame_%06d.jpg")]
+    argv += [*encode_args(fmt, quality), "-vsync", "0", str(dest / f"{prefix}frame_%06d.{fmt.value}")]
 
     typer.secho("    " + " ".join(argv), fg=typer.colors.BRIGHT_BLACK)
     result = subprocess.run(argv)
     if result.returncode != 0:
         raise typer.Exit(code=result.returncode)
-    return sorted(dest.glob(f"{prefix}frame_*.jpg"))
+    return sorted(dest.glob(f"{prefix}frame_*.{fmt.value}"))
 
 
 @dataclass(frozen=True)
@@ -425,9 +436,10 @@ def extract_views(
     start: Optional[str],
     duration: Optional[str],
     quality: int,
+    fmt: FrameFormat,
     prefix: str = "",
 ) -> list[list[Path]]:
-    """Sample a 360° video into dest/<prefix>c<N>_frame_%06d.jpg, one file per view.
+    """Sample a 360° video into dest/<prefix>c<N>_frame_%06d.<fmt>, one file per view.
 
     Returns the frames as groups: every view of one moment. The video is decoded
     once; each lens is resampled first, so all views share the same timestamps.
@@ -452,9 +464,9 @@ def extract_views(
     for n in range(len(views)):
         argv += [
             "-map", f"[o{n}]",
-            "-qscale:v", str(quality),
+            *encode_args(fmt, quality),
             "-fps_mode", "passthrough",
-            str(dest / f"{view_prefix(prefix, n)}frame_%06d.jpg"),
+            str(dest / f"{view_prefix(prefix, n)}frame_%06d.{fmt.value}"),
         ]
 
     typer.secho("    " + " ".join(argv), fg=typer.colors.BRIGHT_BLACK)
@@ -464,7 +476,7 @@ def extract_views(
 
     # A moment only counts if every view of it came out; drop stragglers.
     per_view = [
-        {f.name[len(view_prefix(prefix, n)):]: f for f in dest.glob(f"{view_prefix(prefix, n)}frame_*.jpg")}
+        {f.name[len(view_prefix(prefix, n)):]: f for f in dest.glob(f"{view_prefix(prefix, n)}frame_*.{fmt.value}")}
         for n in range(len(views))
     ]
     common = set(per_view[0]).intersection(*per_view[1:])
@@ -599,6 +611,12 @@ def main(
         min=1,
         max=31,
         help="Video only: JPEG quality of extracted frames (ffmpeg -qscale:v, 1 = best).",
+    ),
+    frame_format: FrameFormat = typer.Option(
+        FrameFormat.jpg,
+        "--frame-format",
+        help="Video only: file format of extracted frames. png is lossless but several "
+        "times larger; --frame-quality then has no effect.",
     ),
     panorama: Panorama = typer.Option(
         Panorama.auto,
@@ -752,13 +770,14 @@ def main(
             if views := layouts[video]:
                 got = extract_views(
                     ffmpeg_bin, video, views, lens_fov, images_dir,
-                    sample, start, duration, frame_quality, prefix,
+                    sample, start, duration, frame_quality, frame_format, prefix,
                 )
             else:
                 got = [
                     [frame]
                     for frame in extract_frames(
-                        ffmpeg_bin, video, images_dir, sample, start, duration, frame_quality, prefix
+                        ffmpeg_bin, video, images_dir, sample, start, duration, frame_quality, frame_format,
+                        prefix,
                     )
                 ]
             if not got:
