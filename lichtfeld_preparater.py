@@ -404,9 +404,10 @@ def view_filter(view: View, lens_fov: float) -> str:
         if view.fisheye
         else "input=e"
     )
+    yaw = (view.yaw + 180) % 360 - 180  # v360 only takes yaw in [-180, 180]
     return (
         f"v360={projection}:output=flat:h_fov={VIEW_FOV:g}:v_fov={VIEW_FOV:g}"
-        f":yaw={view.yaw:g}:w={view.size}:h={view.size}"
+        f":yaw={yaw:g}:w={view.size}:h={view.size}"
     )
 
 
