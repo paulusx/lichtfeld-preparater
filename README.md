@@ -79,6 +79,18 @@ Frames are named `c<N>_frame_000001.jpg` (with the clip prefix, when there are
 several), each view is a `PINHOLE` camera of its own, and `--max-frames` counts
 moments, so a 360° clip contributes six images for every frame it keeps.
 
+Fewer, wider views suit some trainers better. `--lens-views 1` keeps only the
+view straight out of each lens, `--lens 0` or `--lens 1` keeps one lens (video
+stream) only, and `--view-fov` widens every view. Two 120° pinholes back to
+back, posed as a rig:
+
+```bash
+./lichtfeld_preparater.py VID_..._00_005.insv OUT --lens-views 1 --view-fov 120
+```
+
+With a single lens and a single view there is nothing to tie together, so no
+rig is configured.
+
 The raw `.insv` path assumes equidistant lenses of `--lens-fov` (200°) and
 leaves the rest to COLMAP's refinement. An equirectangular export from
 Insta360 Studio uses the camera's factory calibration and is the more accurate
@@ -144,6 +156,9 @@ Large unordered collections need a vocabulary tree
 | `--frame-format` | `jpg` | Video: `jpg` or `png` (lossless, several times larger) |
 | `--panorama` | `auto` | Video: `auto`, `off`, `equirect`, `dual-fisheye` — how to treat 360° clips |
 | `--lens-fov` | `200` | Dual fisheye: field of view of each lens, in degrees |
+| `--lens` | `both` | Dual fisheye: `both`, or only stream `0` or `1` |
+| `--lens-views` | `3` | Dual fisheye: views per lens, `3` or `1` (straight ahead) |
+| `--view-fov` | `90` | 360°: field of view of each flat view, in degrees |
 | `--rig` / `--no-rig` | rig | Pose the views of each 360° frame together as a COLMAP rig |
 | `--ffmpeg` | `ffmpeg` | Path to the ffmpeg executable |
 | `--gpu` / `--no-gpu` | GPU | CUDA for SIFT extraction and matching |

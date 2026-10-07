@@ -73,6 +73,12 @@ class Panorama(str, Enum):
     dual_fisheye = "dual-fisheye"
 
 
+class Lens(str, Enum):
+    both = "both"
+    first = "0"
+    second = "1"
+
+
 class FrameFormat(str, Enum):
     jpg = "jpg"
     png = "png"
@@ -84,12 +90,12 @@ def encode_args(fmt: FrameFormat, quality: int) -> list[str]:
 
 
 # How a 360° frame is cut into flat views. Each view is a square pinhole camera
-# of VIEW_FOV degrees; neighbours overlap so features carry across them.
+# of --view-fov degrees; neighbours overlap so features carry across them.
 VIEW_FOV = 90.0
 EQUIRECT_YAWS = (0.0, 60.0, 120.0, 180.0, 240.0, 300.0)
 # Dual fisheye: views stay within one lens each, so none straddles the stitch
 # seam. Yaws are relative to that lens's axis; the back lens faces yaw 180.
-LENS_YAWS = (-45.0, 0.0, 45.0)
+LENS_YAWS = {3: (-45.0, 0.0, 45.0), 1: (0.0,)}
 DEFAULT_LENS_FOV = 200.0  # Insta360 X-series lenses see a bit over a hemisphere
 
 
@@ -328,6 +334,7 @@ class View:
     rig_yaw: float  # direction of the view within the rig, which faces yaw 0
     fisheye: bool
     size: int  # square output, in pixels
+    fov: float  # of the pinhole view, in degrees, both ways
 
 
 def video_streams(ffprobe: str, video: Path) -> list[tuple[str, int, int]]:
@@ -360,7 +367,13 @@ def even(value: float) -> int:
 
 
 def panorama_views(
-    ffprobe: str, video: Path, mode: Panorama, lens_fov: float
+    ffprobe: str,
+    video: Path,
+    mode: Panorama,
+    lens_fov: float,
+    view_fov: float = VIEW_FOV,
+    lens: Lens = Lens.both,
+    lens_views: int = 3,
 ) -> list[View]:
     """The flat views to cut out of this video, or [] if it is an ordinary one.
 
@@ -386,8 +399,8 @@ def panorama_views(
             return []
 
     if mode is Panorama.equirect:
-        size = even(width * VIEW_FOV / 360)
-        return [View(first, yaw, yaw, False, size) for yaw in EQUIRECT_YAWS]
+        size = even(width * view_fov / 360)
+        return [View(first, yaw, yaw, False, size, view_fov) for yaw in EQUIRECT_YAWS]
 
     if two_lenses:
         lenses = [first, streams[1][0]]
@@ -401,11 +414,14 @@ def panorama_views(
             err=True,
         )
         raise typer.Exit(code=2)
-    size = even(height * VIEW_FOV / lens_fov)
+    # The rig faces the first lens kept; the other one looks the opposite way.
+    if lens is not Lens.both:
+        lenses = [lenses[int(lens.value)]]
+    size = even(height * view_fov / lens_fov)
     return [
-        View(source, yaw, (axis + yaw) % 360, True, size)
+        View(source, yaw, (axis + yaw) % 360, True, size, view_fov)
         for source, axis in zip(lenses, (0.0, 180.0))
-        for yaw in LENS_YAWS
+        for yaw in LENS_YAWS[lens_views]
     ]
 
 
@@ -417,7 +433,7 @@ def view_filter(view: View, lens_fov: float) -> str:
     )
     yaw = (view.yaw + 180) % 360 - 180  # v360 only takes yaw in [-180, 180]
     return (
-        f"v360={projection}:output=flat:h_fov={VIEW_FOV:g}:v_fov={VIEW_FOV:g}"
+        f"v360={projection}:output=flat:h_fov={view.fov:g}:v_fov={view.fov:g}"
         f":yaw={yaw:g}:w={view.size}:h={view.size}"
     )
 
@@ -510,8 +526,8 @@ def cam_from_rig(yaw: float) -> list[float]:
     return [math.cos(half), 0.0, math.sin(half), 0.0]
 
 
-def pinhole_params(size: int) -> str:
-    focal = size / 2 / math.tan(math.radians(VIEW_FOV) / 2)
+def pinhole_params(size: int, fov: float) -> str:
+    focal = size / 2 / math.tan(math.radians(fov) / 2)
     return f"{focal:.4f},{focal:.4f},{size / 2:g},{size / 2:g}"
 
 
@@ -623,7 +639,27 @@ def main(
         "--panorama",
         help="Video only: how to treat 360° video. auto detects an Insta360 .insv (dual "
         "fisheye) or a 2:1 equirectangular video per clip; the others force one kind on "
-        f"every clip. Each 360° frame becomes {len(EQUIRECT_YAWS)} flat {VIEW_FOV:g}° views.",
+        f"every clip. An equirectangular frame becomes {len(EQUIRECT_YAWS)} flat views; "
+        "a dual fisheye one --lens-views per lens.",
+    ),
+    view_fov: float = typer.Option(
+        VIEW_FOV,
+        "--view-fov",
+        min=10.0,
+        max=150.0,
+        help="360° only: field of view of each flat pinhole view, in degrees.",
+    ),
+    lens: Lens = typer.Option(
+        Lens.both,
+        "--lens",
+        help="Dual fisheye only: cut views from both lenses, or only from video "
+        "stream 0 or 1.",
+    ),
+    lens_views: int = typer.Option(
+        3,
+        "--lens-views",
+        help="Dual fisheye only: views per lens — 3 (straight ahead and 45° to either "
+        "side) or 1 (straight ahead).",
     ),
     lens_fov: float = typer.Option(
         DEFAULT_LENS_FOV,
@@ -687,6 +723,9 @@ def main(
     if every > 1 and fps != 0:
         typer.secho("Pass either --fps or --every, not both.", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
+    if lens_views not in LENS_YAWS:
+        typer.secho("--lens-views must be 1 or 3.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
     source = folders[0] if folders else videos[0]
 
     if matcher is None:
@@ -725,7 +764,9 @@ def main(
             raise typer.Exit(code=1)
 
     layouts = {
-        video: panorama_views(ffprobe_for(ffmpeg_bin), video, panorama, lens_fov)
+        video: panorama_views(
+            ffprobe_for(ffmpeg_bin), video, panorama, lens_fov, view_fov, lens, lens_views
+        )
         for video in videos
     }
     for video, views in layouts.items():
@@ -810,7 +851,7 @@ def main(
                         [g[n].name for g in got if g[n].name in present],
                         "PINHOLE",
                         True,
-                        pinhole_params(view.size),
+                        pinhole_params(view.size, view.fov),
                     )
                 )
                 camera: dict = {"image_prefix": view_prefix(prefix, n)}
@@ -822,7 +863,8 @@ def main(
                 cameras.append(camera)
             # COLMAP adds sensors in order and wants the reference one first.
             cameras.sort(key=lambda camera: not camera.get("ref_sensor", False))
-            rigs.append({"cameras": cameras})
+            if len(cameras) > 1:  # a lone view needs no rig
+                rigs.append({"cameras": cameras})
     else:
         echo_step(f"Staging {len(images_in)} images into {images_dir} ({link_mode.value})")
         place_images(images_in, images_dir, link_mode)
