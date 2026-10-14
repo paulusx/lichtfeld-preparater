@@ -56,6 +56,67 @@ class Matcher(str, Enum):
     spatial = "spatial"
 
 
+# Above this many images, matching every pair gets slow (it grows with the
+# square of the count) and a vocabulary tree picks the pairs worth matching.
+EXHAUSTIVE_LIMIT = 500
+
+# Where COLMAP's prebuilt vocabulary trees are (the Nix package sets it).
+VOCAB_TREES_ENV = "LICHTFELD_VOCAB_TREES"
+# They are FAISS trees, which COLMAP 3.12 and later read; the FLANN ones
+# before them are not. File name by vocabulary size.
+VOCAB_TREE_FILE = "vocab_tree_faiss_flickr100K_words{}.bin"
+
+
+class VocabSize(str, Enum):
+    auto = "auto"
+    small = "32K"
+    medium = "256K"
+    large = "1M"
+
+
+# The vocabulary each collection size wants, as COLMAP recommends: up to
+# this many images, this tree.
+VOCAB_SIZE_LIMITS = [(1_000, VocabSize.small), (10_000, VocabSize.medium)]
+
+
+def vocab_size_for(count: int) -> VocabSize:
+    """The tree that suits `count` images."""
+    for limit, size in VOCAB_SIZE_LIMITS:
+        if count < limit:
+            return size
+    return VocabSize.large
+
+
+def find_vocab_tree(directory: Optional[Path], size: VocabSize, count: int) -> Optional[Path]:
+    """The tree of `size` (or the one `count` images want, for auto) in
+    `directory`, or the nearest size there is."""
+    if directory is None:
+        return None
+    wanted = vocab_size_for(count) if size is VocabSize.auto else size
+    order = [VocabSize.small, VocabSize.medium, VocabSize.large]
+    # The wanted size first, then the others nearest to it.
+    for candidate in sorted(order, key=lambda s: abs(order.index(s) - order.index(wanted))):
+        path = directory / VOCAB_TREE_FILE.format(candidate.value)
+        if path.is_file():
+            return path
+    return None
+
+
+def choose_matcher(videos: int, count: int, have_trees: bool) -> tuple[Matcher, str]:
+    """The matcher for `count` images from `videos` videos (0 for an image
+    folder), and why."""
+    if videos == 1:
+        return Matcher.sequential, "one video — its frames are in order"
+    what = f"{videos} videos" if videos else "an image folder"
+    if count <= EXHAUSTIVE_LIMIT:
+        return Matcher.exhaustive, f"{what}, {count} images — every pair is affordable"
+    if not have_trees:
+        return Matcher.exhaustive, (
+            f"{what}, {count} images — no vocabulary tree found, so every pair (slow)"
+        )
+    return Matcher.vocab_tree, f"{what}, {count} images — too many to match every pair"
+
+
 class CameraModel(str, Enum):
     simple_pinhole = "SIMPLE_PINHOLE"
     pinhole = "PINHOLE"
@@ -572,9 +633,9 @@ def main(
         None,
         "--matcher",
         "-m",
-        help="Matching strategy. Defaults to 'exhaustive' for image folders and several "
-        "videos, and 'sequential' for a single video; 'vocab_tree' scales to thousands "
-        "of unordered images.",
+        help="Matching strategy. By default chosen from the input: 'sequential' for a "
+        f"single video, 'exhaustive' for an image folder or several videos of up to "
+        f"{EXHAUSTIVE_LIMIT} images, 'vocab_tree' above that.",
     ),
     camera_model: CameraModel = typer.Option(
         CameraModel.opencv, "--camera-model", "-c", help="COLMAP camera model."
@@ -678,7 +739,23 @@ def main(
         "--vocab-tree",
         exists=True,
         dir_okay=False,
-        help="Vocabulary tree file, required for --matcher vocab_tree.",
+        help="Vocabulary tree file for --matcher vocab_tree, instead of one from "
+        "--vocab-trees.",
+    ),
+    vocab_trees: Optional[Path] = typer.Option(
+        None,
+        "--vocab-trees",
+        envvar=VOCAB_TREES_ENV,
+        file_okay=False,
+        help="Folder of COLMAP's prebuilt FAISS vocabulary trees ("
+        + VOCAB_TREE_FILE.format("{32K,256K,1M}")
+        + "). The package sets it.",
+    ),
+    vocab_tree_size: VocabSize = typer.Option(
+        VocabSize.auto,
+        "--vocab-tree-size",
+        help="Which tree from --vocab-trees: auto takes 32K below 1,000 images, 256K "
+        "below 10,000, and 1M above.",
     ),
     gpu: bool = typer.Option(True, "--gpu/--no-gpu", help="Use CUDA for SIFT and matching."),
     max_image_size: int = typer.Option(
@@ -728,25 +805,17 @@ def main(
         raise typer.Exit(code=2)
     source = folders[0] if folders else videos[0]
 
-    if matcher is None:
-        # One clip's frames are in order; several clips have to be matched
-        # against each other too, which only exhaustive matching does.
-        matcher = Matcher.sequential if len(videos) == 1 else Matcher.exhaustive
-        if is_video:
-            typer.secho(
-                "Video source — using --matcher sequential (frames are ordered)."
-                if len(videos) == 1
-                else f"{len(videos)} videos — using --matcher exhaustive (clips must match each other).",
-                fg=typer.colors.YELLOW,
-            )
-
+    if vocab_trees is not None and not vocab_trees.is_dir():
+        vocab_trees = None
     if is_video and shutil.which(ffmpeg_bin) is None:
         typer.secho(f"ffmpeg executable not found: {ffmpeg_bin}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
 
-    if matcher is Matcher.vocab_tree and vocab_tree_path is None:
+    have_trees = vocab_tree_path is not None or find_vocab_tree(vocab_trees, VocabSize.auto, 0) is not None
+    if matcher is Matcher.vocab_tree and not have_trees:
         typer.secho(
-            "--matcher vocab_tree requires --vocab-tree /path/to/vocab_tree.bin",
+            "--matcher vocab_tree needs a vocabulary tree: --vocab-tree FILE, or "
+            f"--vocab-trees DIR (or ${VOCAB_TREES_ENV}).",
             fg=typer.colors.RED,
             err=True,
         )
@@ -903,13 +972,24 @@ def main(
                 {"database_path": database, "rig_config_path": rig_config},
             )
 
+    # Chosen now that the number of images is known.
+    if matcher is None:
+        matcher, why = choose_matcher(len(videos), len(images_in), have_trees)
+        typer.secho(f"Using --matcher {matcher.value}: {why}.", fg=typer.colors.YELLOW)
+    if matcher is Matcher.vocab_tree and vocab_tree_path is None:
+        vocab_tree_path = find_vocab_tree(vocab_trees, vocab_tree_size, len(images_in))
+        typer.secho(
+            f"Using vocabulary tree {vocab_tree_path.name} for {len(images_in)} images.",
+            fg=typer.colors.YELLOW,
+        )
+
     echo_step(f"Matching features ({matcher.value})")
     match_command = f"{matcher.value}_matcher"
     match_opts = supported_options(colmap_bin, match_command)
     match_args: dict[str, ArgValue] = {"database_path": database}
     if name := prefixed(match_opts, ["FeatureMatching", "SiftMatching"], "use_gpu"):
         match_args[name] = int(gpu)
-    if vocab_tree_path is not None:
+    if matcher is Matcher.vocab_tree:
         match_args["VocabTreeMatching.vocab_tree_path"] = vocab_tree_path
     run(colmap_bin, match_command, match_args)
 

@@ -132,18 +132,49 @@ Save disk space instead of duplicating 3 GB of JPEGs:
 ./lichtfeld_preparater.py IN OUT --link-mode hardlink
 ```
 
-Large unordered collections need a vocabulary tree
-([download](https://demuc.de/colmap/#download)):
+### Choosing the matcher
+
+Without `--matcher`, the matcher is chosen once the images are counted:
+
+| Input | Matcher | Why |
+| --- | --- | --- |
+| one video | `sequential` | its frames are in order |
+| image folder or several videos, up to 500 images | `exhaustive` | every pair is affordable, and clips must be matched against each other |
+| more than 500 images | `vocab_tree` | every pair grows with the square of the count; the tree picks the pairs worth matching |
+
+`vocab_tree` matches each image only with the ones that look most alike, found
+through a vocabulary tree of visual words (Nistér and Stewénius, CVPR 2006). It
+needs one of COLMAP's prebuilt trees. The Nix package bundles all three and points
+`$LICHTFELD_VOCAB_TREES` at them; elsewhere, download them from
+[COLMAP's 3.11.1 release](https://github.com/colmap/colmap/releases/tag/3.11.1) into
+a folder and pass `--vocab-trees DIR`. The tree is chosen by image count too:
+
+| Images | Tree | Size |
+| --- | --- | --- |
+| under 1,000 | `vocab_tree_faiss_flickr100K_words32K.bin` | 9 MB |
+| under 10,000 | `vocab_tree_faiss_flickr100K_words256K.bin` | 72 MB |
+| more | `vocab_tree_faiss_flickr100K_words1M.bin` | 282 MB |
+
+These are the FAISS trees that COLMAP 3.12 and later read; the older FLANN trees
+from demuc.de do not load. Force a size with `--vocab-tree-size`, or a file of your
+own with `--vocab-tree`:
 
 ```bash
-./lichtfeld_preparater.py IN OUT --matcher vocab_tree --vocab-tree ~/vocab_tree_flickr100K_words256K.bin
+./lichtfeld_preparater.py IN OUT --matcher vocab_tree --vocab-tree-size 256K
+./lichtfeld_preparater.py IN OUT --matcher vocab_tree --vocab-tree ~/my_tree.bin
 ```
+
+Without a tree, collections over 500 images fall back to `exhaustive`, which works
+but is slow.
 
 ### Options
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--matcher` / `-m` | `exhaustive` (images, several videos), `sequential` (one video) | `exhaustive`, `sequential`, `vocab_tree`, `spatial` |
+| `--matcher` / `-m` | chosen from the input (see above) | `exhaustive`, `sequential`, `vocab_tree`, `spatial` |
+| `--vocab-trees` | `$LICHTFELD_VOCAB_TREES` | Folder of COLMAP's prebuilt FAISS trees |
+| `--vocab-tree-size` | `auto` | `auto` (by image count), `32K`, `256K`, `1M` |
+| `--vocab-tree` | — | A tree file of your own, instead of `--vocab-trees` |
 | `--camera-model` / `-c` | `OPENCV` | COLMAP camera model |
 | `--single-camera` / `--per-image-camera` | single | Share one intrinsics block across all images |
 | `--link-mode` / `-l` | `copy` | `copy`, `symlink`, `hardlink` (image folders only) |
